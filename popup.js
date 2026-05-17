@@ -45,7 +45,7 @@ function formatMessages(messages, format) {
 function updatePreview() {
   const formatted = formatMessages(extractedMessages, currentFormat);
   const previewBox = document.getElementById('previewBox');
-  const preview = formatted.substring(0, 1200) + (formatted.length > 1200 ? '\n\n... (truncated)' : '');
+  const preview = formatted.substring(0, 1200) + (formatted.length > 1200 ? '\n\n... (truncated in preview)' : '');
   previewBox.textContent = preview;
   previewBox.classList.add('visible');
 }
@@ -54,29 +54,37 @@ function getExtension(format) {
   return { txt: 'txt', json: 'json', csv: 'csv', md: 'md' }[format] || 'txt';
 }
 
+async function getTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab;
+}
+
+async function ensureContentScript(tabId) {
+  await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }).catch(() => {});
+}
+
+// Quick extract (visible only)
 document.getElementById('btnExtract').addEventListener('click', async () => {
   const btn = document.getElementById('btnExtract');
   btn.disabled = true;
   btn.innerHTML = '<div class="spinner"></div> Extracting...';
-  setStatus('Scanning messages...', 'idle');
+  setStatus('Scanning visible messages...', 'idle');
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tab = await getTab();
     if (!tab.url || !tab.url.includes('web.telegram.org')) {
       setStatus('Please open web.telegram.org first', 'error');
-      btn.disabled = false;
-      btn.innerHTML = 'Extract Messages';
+      btn.disabled = false; btn.innerHTML = 'Extract Visible';
       return;
     }
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }).catch(() => {});
+    await ensureContentScript(tab.id);
     const response = await chrome.tabs.sendMessage(tab.id, { action: 'extractMessages' });
     if (!response || !response.messages || response.messages.length === 0) {
       setStatus('No messages found. Make sure a chat is open.', 'error');
-      document.getElementById('previewBox').classList.remove('visible');
     } else {
       extractedMessages = response.messages;
       const count = extractedMessages.length;
-      setStatus(`Found ${count} message${count > 1 ? 's' : ''}`, 'active');
-      document.getElementById('footerNote').textContent = `Messages numbered 1 – ${count}`;
+      setStatus(`Got ${count} message${count > 1 ? 's' : ''} (visible only)`, 'active');
+      document.getElementById('footerNote').textContent = `Messages #1 – #${count}`;
       document.getElementById('btnCopy').disabled = false;
       document.getElementById('btnDownload').disabled = false;
       updatePreview();
@@ -85,7 +93,58 @@ document.getElementById('btnExtract').addEventListener('click', async () => {
     setStatus('Error: ' + (err.message || 'Could not connect'), 'error');
   }
   btn.disabled = false;
-  btn.innerHTML = 'Extract Messages';
+  btn.innerHTML = 'Extract Visible';
+});
+
+// Full extract (auto-scroll through entire chat)
+document.getElementById('btnExtractAll').addEventListener('click', async () => {
+  const btn = document.getElementById('btnExtractAll');
+  btn.disabled = true;
+  document.getElementById('btnExtract').disabled = true;
+  setStatus('Auto-scrolling... collecting messages', 'idle');
+
+  // Listen for progress updates
+  const progressListener = (msg) => {
+    if (msg.action === 'progress') {
+      setStatus(`Collecting... ${msg.count} messages so far`, 'idle');
+    }
+  };
+  chrome.runtime.onMessage.addListener(progressListener);
+
+  try {
+    const tab = await getTab();
+    if (!tab.url || !tab.url.includes('web.telegram.org')) {
+      setStatus('Please open web.telegram.org first', 'error');
+      btn.disabled = false; document.getElementById('btnExtract').disabled = false;
+      chrome.runtime.onMessage.removeListener(progressListener);
+      return;
+    }
+    await ensureContentScript(tab.id);
+
+    btn.innerHTML = '<div class="spinner"></div> Scrolling...';
+
+    const response = await chrome.tabs.sendMessage(tab.id, { action: 'extractAll' });
+    chrome.runtime.onMessage.removeListener(progressListener);
+
+    if (!response || !response.messages || response.messages.length === 0) {
+      setStatus('No messages found. Make sure a chat is open.', 'error');
+    } else {
+      extractedMessages = response.messages;
+      const count = extractedMessages.length;
+      setStatus(`✓ Extracted ${count} messages`, 'active');
+      document.getElementById('footerNote').textContent = `Messages #1 – #${count}`;
+      document.getElementById('btnCopy').disabled = false;
+      document.getElementById('btnDownload').disabled = false;
+      updatePreview();
+    }
+  } catch (err) {
+    chrome.runtime.onMessage.removeListener(progressListener);
+    setStatus('Error: ' + (err.message || 'Could not connect'), 'error');
+  }
+
+  btn.disabled = false;
+  btn.innerHTML = 'Extract ALL (auto-scroll)';
+  document.getElementById('btnExtract').disabled = false;
 });
 
 document.getElementById('btnCopy').addEventListener('click', async () => {
@@ -95,9 +154,7 @@ document.getElementById('btnCopy').addEventListener('click', async () => {
     const btn = document.getElementById('btnCopy');
     btn.innerHTML = '\u2713 Copied!';
     setTimeout(() => { btn.innerHTML = 'Copy to Clipboard'; }, 1800);
-  } catch (e) {
-    setStatus('Clipboard access denied', 'error');
-  }
+  } catch (e) { setStatus('Clipboard access denied', 'error'); }
 });
 
 document.getElementById('btnDownload').addEventListener('click', () => {
